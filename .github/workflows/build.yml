@@ -1,0 +1,84 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Xcode 版本
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+
+      - name: 解压并编译打包
+        run: |
+          # 1. 解压所有 zip 文件
+          find . -maxdepth 2 -iname "*.zip" -exec unzip -o -q "{}" \;
+
+          # 2. 定位到真正的项目目录
+          SUB_PKG=$(find . -mindepth 2 -name "Package.swift" -not -path "*/.*" -exec dirname {} \; | head -n 1)
+          if [ -n "$SUB_PKG" ]; then
+            cd "$SUB_PKG"
+          else
+            ROOT_PKG=$(find . -name "Package.swift" -not -path "*/.*" -exec dirname {} \; | head -n 1)
+            cd "$ROOT_PKG"
+          fi
+
+          # 3. 清理多余的 Assets 冲突
+          find . -name "Assets.xcassets" | tail -n +2 | while read -r dup; do
+            rm -rf "$dup"
+          done
+
+          # 4. 自动修复常见的 iOS 16/17 SwiftUI 语法差异
+          # (1) 将 topBarLeading 兼容为 navigationBarLeading
+          find . -name "*.swift" -exec sed -i '' 's/\.topBarLeading/\.navigationBarLeading/g' {} +
+          # (2) 将工程目标版本设为 iOS 17 以支持全部现代 SwiftUI 语法
+          find . -name "Package.swift" -exec sed -i '' 's/\.iOS("16.0")/\.iOS("17.0")/g' {} +
+
+          # 5. 获取 Scheme
+          SCHEME=$(xcodebuild -list 2>/dev/null | awk '/Schemes:/{flag=1;next} flag && NF{print $1; exit}')
+          if [ -z "$SCHEME" ]; then
+            SCHEME="You"
+          fi
+          echo "编译 Scheme: $SCHEME"
+
+          # 6. 执行编译并记录日志
+          set +e
+          xcodebuild build \
+            -scheme "$SCHEME" \
+            -destination "generic/platform=iOS" \
+            -configuration Release \
+            -derivedDataPath ./build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" > build.log 2>&1
+          
+          BUILD_STATUS=$?
+          if [ $BUILD_STATUS -ne 0 ]; then
+            echo "================ [编译错误详细信息] ================"
+            grep -E "error:" build.log | grep -v "ResultBundle" | head -n 20
+            echo "====================================================="
+            exit $BUILD_STATUS
+          fi
+          set -e
+
+          # 7. 打包成 IPA
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p Payload
+          APP_PATH=$(find . -name "*.app" -path "*/Release-iphoneos/*" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            APP_PATH=$(find . -name "*.app" | head -n 1)
+          fi
+          cp -r "$APP_PATH" Payload/
+          zip -r You.ipa Payload
+          echo "🎉 恭喜！IPA 文件打包全部完成！"
+
+      - name: 上传 IPA 供下载
+        uses: actions/upload-artifact@v4
+        with:
+          name: You-App-IPA
+          path: You.ipa
